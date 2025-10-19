@@ -104,6 +104,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma separated list of additional devices (e.g. 'gpu') to benchmark.",
     )
+    parser.add_argument(
+        "--safe-gpu",
+        action="store_true",
+        help="Reduce GPU workload by auto-cropping and lowering batch sizes.",
+    )
+    parser.add_argument(
+        "--safe-gpu-max-scan",
+        type=int,
+        default=128,
+        help="Maximum scan dimension when --safe-gpu is enabled.",
+    )
+    parser.add_argument(
+        "--safe-gpu-max-batch",
+        type=int,
+        default=32,
+        help="Maximum virtual BF batch size when --safe-gpu is enabled.",
+    )
+    parser.add_argument(
+        "--safe-gpu-keep-vectorized-com",
+        action="store_true",
+        help="Keep the vectorized CoM path when --safe-gpu is enabled (default disables it).",
+    )
     return parser.parse_args()
 
 
@@ -160,7 +182,9 @@ def run_parallax_reference(
     device: str,
     alignment_bins,
     capture_outputs: bool,
+    overrides: dict | None = None,
 ) -> dict:
+    overrides = overrides or {}
     if device == "gpu":
         try:
             import cupy  # noqa: F401
@@ -176,12 +200,22 @@ def run_parallax_reference(
     )
     parallax.attach_datacube(datacube)
 
+    vectorized_com = overrides.get(
+        "vectorized_com_calculation", not args.no_vectorized_com
+    )
+    selected_max_batch = (
+        overrides["max_batch_size"]
+        if overrides.get("max_batch_size") is not None
+        else args.max_batch_size
+    )
+
     preprocess_start = perf_counter()
     parallax.preprocess(
         plot_average_bf=False,
         progress_bar=False,
-        vectorized_com_calculation=not args.no_vectorized_com,
+        vectorized_com_calculation=vectorized_com,
         store_initial_arrays=True,
+        max_batch_size=selected_max_batch,
     )
     preprocess_time = perf_counter() - preprocess_start
 
@@ -189,33 +223,62 @@ def run_parallax_reference(
         plot_aligned_bf=False,
         plot_convergence=False,
         progress_bar=False,
-        max_batch_size=args.max_batch_size,
+        max_batch_size=selected_max_batch,
         alignment_bin_values=alignment_bins,
         running_average=True,
         regularize_shifts=False,
     )
+    if "alignment_bin_values" in overrides:
+        reconstruct_kwargs["alignment_bin_values"] = overrides["alignment_bin_values"]
+    if "running_average" in overrides and overrides["running_average"] is not None:
+        reconstruct_kwargs["running_average"] = overrides["running_average"]
+    if "clear_fft_cache" in overrides and overrides["clear_fft_cache"] is not None:
+        reconstruct_kwargs["clear_fft_cache"] = overrides["clear_fft_cache"]
     if capture_outputs:
         reconstruct_kwargs["return_shifts_and_aligned_bf"] = True
 
     reconstruct_start = perf_counter()
-    recon_result = parallax.reconstruct(**reconstruct_kwargs)
-    reconstruct_time = perf_counter() - reconstruct_start
+    try:
+        recon_result = parallax.reconstruct(**reconstruct_kwargs)
+        reconstruct_time = perf_counter() - reconstruct_start
+    finally:
+        if device == "gpu":
+            try:
+                import cupy as cp
+                default_pool = getattr(cp.cuda, 'get_default_memory_pool', None)
+                if callable(default_pool):
+                    default_pool().free_all_blocks()
+                pinned_pool = getattr(cp.cuda, 'get_default_pinned_memory_pool', None)
+                if callable(pinned_pool):
+                    pinned_pool().free_all_blocks()
+            except ImportError:  # pragma: no cover - cupy optional
+                pass
+
 
     aligned_bf = shifts_ang = None
     if capture_outputs:
-        shifts_ang, aligned_bf = recon_result
+        if isinstance(recon_result, tuple) and len(recon_result) == 2:
+            shifts_ang, aligned_bf = recon_result
+        else:
+            # Some Parallax builds return self; fall back to attributes if available.
+            shifts_ang = getattr(parallax, 'shifts_ang', None)
+            aligned_bf = getattr(parallax, 'aligned_bf', None)
+        if shifts_ang is not None and aligned_bf is not None:
 
-        def _to_numpy(array):
-            try:
-                import cupy as cp
-                if isinstance(array, cp.ndarray):
-                    return cp.asnumpy(array)
-            except ImportError:  # pragma: no cover - cupy optional
-                pass
-            return np.asarray(array)
+            def _to_numpy(array):
+                try:
+                    import cupy as cp
+                    if isinstance(array, cp.ndarray):
+                        return cp.asnumpy(array)
+                except ImportError:  # pragma: no cover - cupy optional
+                    pass
+                return np.asarray(array)
 
-        aligned_bf = _to_numpy(aligned_bf)
-        shifts_ang = _to_numpy(shifts_ang)
+            aligned_bf = _to_numpy(aligned_bf)
+            shifts_ang = _to_numpy(shifts_ang)
+        else:
+            print('[warning] Visualization requested but Parallax did not provide output arrays.')
+            capture_outputs = False
 
     total_time = preprocess_time + reconstruct_time
     return {
@@ -309,10 +372,11 @@ def main() -> None:
             raise TypeError(f'Unsupported dataset type {type(data_obj)} loaded from {dataset_path}')
     else:
         datacube = import_file(dataset_path_str, mem="RAM", **extra_kwargs)
-    datacube = maybe_crop_datacube(datacube, args.max_scan)
+
     datacube = ensure_parallax_calibration(
         datacube, args.real_pixel_size, args.diffraction_pixel_size
     )
+    base_datacube = maybe_crop_datacube(datacube, args.max_scan)
 
     alignment_bins = None
     if args.alignment_bins:
@@ -324,12 +388,44 @@ def main() -> None:
             if dev and dev not in devices:
                 devices.append(dev)
 
+    if args.safe_gpu and "gpu" not in devices:
+        print("[warning] --safe-gpu was requested but no GPU run is scheduled.")
+
     results = []
     for dev in devices:
         capture_outputs = bool(args.visualize)
+        device_datacube = base_datacube
+        device_alignment_bins = alignment_bins
+        device_overrides = {}
+
+        if dev == "gpu" and args.safe_gpu:
+            safe_datacube = maybe_crop_datacube(base_datacube, args.safe_gpu_max_scan)
+            if safe_datacube.shape[:2] != base_datacube.shape[:2]:
+                device_datacube = safe_datacube
+                print(
+                    f"[info] GPU safe mode: cropped scan to {device_datacube.shape[0]}x{device_datacube.shape[1]}."
+                )
+            if args.max_batch_size is None:
+                device_overrides["max_batch_size"] = args.safe_gpu_max_batch
+                print(f"[info] GPU safe mode: limiting max batch size to {args.safe_gpu_max_batch}.")
+            if not args.safe_gpu_keep_vectorized_com and not args.no_vectorized_com:
+                device_overrides["vectorized_com_calculation"] = False
+                print("[info] GPU safe mode: disabling vectorized CoM.")
+            device_overrides["clear_fft_cache"] = True
+            if device_alignment_bins and len(device_alignment_bins) > 4:
+                device_alignment_bins = device_alignment_bins[:4]
+                print("[info] GPU safe mode: trimming alignment bins to first 4 values.")
+
         print(f"\n=== Running parallax on device: {dev} ===")
         try:
-            stats = run_parallax_reference(datacube, args, dev, alignment_bins, capture_outputs)
+            stats = run_parallax_reference(
+                device_datacube,
+                args,
+                dev,
+                device_alignment_bins,
+                capture_outputs,
+                overrides=device_overrides,
+            )
         except Exception as exc:
             print(f"[warning] Failed on device '{dev}': {exc}")
             continue
